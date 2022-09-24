@@ -14,10 +14,11 @@ class PLMSSampler(object):
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
-            if attr.device != torch.device("cuda"):
+            if attr.device != torch.device("cuda") and self.device == 'cuda':
                 attr = attr.to(torch.device("cuda"))
         setattr(self, name, attr)
 
