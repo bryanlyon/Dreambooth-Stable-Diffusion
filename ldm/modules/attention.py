@@ -2,7 +2,7 @@ from inspect import isfunction
 import math
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
+from torch import nn, einsum, autocast
 from einops import rearrange, repeat
 
 from ldm.modules.diffusionmodules.util import checkpoint
@@ -154,6 +154,7 @@ class CrossAttention(nn.Module):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         self.scale = dim_head ** -0.5
         self.heads = heads
@@ -168,34 +169,65 @@ class CrossAttention(nn.Module):
         )
 
     def forward(self, x, context=None, mask=None):
-        h = self.heads
+        if self.device == 'cpu':
+            h = self.heads
 
-        q = self.to_q(x)
-        context = default(context, x)
-        k = self.to_k(context)
-        v = self.to_v(context)
-        del context, x
+            q = self.to_q(x)
+            context = default(context, x)
+            k = self.to_k(context)
+            v = self.to_v(context)
+            del context, x
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale  # (8, 4096, 40)
-        del q, k
+            sim = einsum('b i d, b j d -> b i j', q, k) * self.scale  # (8, 4096, 40)
+            del q, k
 
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
-            del mask
+            if exists(mask):
+                mask = rearrange(mask, 'b ... -> b (...)')
+                max_neg_value = -torch.finfo(sim.dtype).max
+                mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                sim.masked_fill_(~mask, max_neg_value)
+                del mask
 
-        # attention, what we cannot get enough of, by halves
-        sim[4:] = sim[4:].softmax(dim=-1)
-        sim[:4] = sim[:4].softmax(dim=-1)
+            # attention, what we cannot get enough of, by halves
+            sim[4:] = sim[4:].softmax(dim=-1)
+            sim[:4] = sim[:4].softmax(dim=-1)
 
-        sim = einsum('b i j, b j d -> b i d', sim, v)
-        sim = rearrange(sim, '(b h) n d -> b n (h d)', h=h)
-        return self.to_out(sim)
+            sim = einsum('b i j, b j d -> b i d', sim, v)
+            sim = rearrange(sim, '(b h) n d -> b n (h d)', h=h)
+            return self.to_out(sim)
+        else:
+            h = self.heads
 
+            q = self.to_q(x)
+            context = default(context, x)
+            k = self.to_k(context)
+            v = self.to_v(context)
+            del context, x
+
+            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+            r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device)
+
+            # valid values for steps = 2,4,8,16,32,64
+            # higher steps is slower but less memory usage
+            # at 16 can run 1920x1536 on a 3090, at 64 can run over 1920x1920
+            # speed seems to be impacted more on 30x series cards
+            steps = 16
+            slice_size = q.shape[1] // steps if q.shape[1] % steps == 0 else q.shape[1]
+            for i in range(0, q.shape[1], slice_size):
+                end = i + slice_size
+                s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k)
+                s1 *= self.scale
+                s2 = s1.softmax(dim=-1)
+                del s1
+                r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
+                del s2
+            r2 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
+            del r1
+
+            return self.to_out(r2)
 
 class BasicTransformerBlock(nn.Module):
     def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
