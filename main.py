@@ -1,4 +1,4 @@
-import argparse, os, sys, datetime, glob, importlib, csv
+import argparse, os, sys, datetime, glob, importlib, csv, gc
 import numpy as np
 import time
 import torch
@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import random_split, DataLoader, Dataset, Subset
 from functools import partial
 from PIL import Image
+from torch import autocast
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
@@ -115,7 +116,7 @@ def get_parser(**parser_kwargs):
         "-s",
         "--seed",
         type=int,
-        default=23,
+        default=None,
         help="seed for seed_everything",
     )
     parser.add_argument(
@@ -142,40 +143,40 @@ def get_parser(**parser_kwargs):
     )
 
     parser.add_argument(
-        "--datadir_in_name", 
-        type=str2bool, 
-        nargs="?", 
-        const=True, 
-        default=True, 
+        "--datadir_in_name",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
         help="Prepend the final directory in the data_root to the output directory name")
 
-    parser.add_argument("--actual_resume", 
+    parser.add_argument("--actual_resume",
         type=str,
         required=True,
         help="Path to model to actually resume from")
 
-    parser.add_argument("--data_root", 
-        type=str, 
-        required=True, 
+    parser.add_argument("--data_root",
+        type=str,
+        required=True,
         help="Path to directory with training images")
-    
-    parser.add_argument("--reg_data_root", 
-        type=str, 
-        required=True, 
+
+    parser.add_argument("--reg_data_root",
+        type=str,
+        required=True,
         help="Path to directory with regularization images")
 
-    parser.add_argument("--embedding_manager_ckpt", 
-        type=str, 
-        default="", 
+    parser.add_argument("--embedding_manager_ckpt",
+        type=str,
+        default="",
         help="Initialize embedding manager from a checkpoint")
 
-    parser.add_argument("--class_word", 
-        type=str, 
+    parser.add_argument("--class_word",
+        type=str,
         default="dog",
         help="Placeholder token which will be used to denote the concept in future prompts")
 
-    parser.add_argument("--init_word", 
-        type=str, 
+    parser.add_argument("--init_word",
+        type=str,
         help="Word to use as source for initial token embedding")
 
     return parser
@@ -225,7 +226,7 @@ class ConcatDataset(Dataset):
 
     def __len__(self):
         return min(len(d) for d in self.datasets)
-    
+
 class DataModuleFromConfig(pl.LightningDataModule):
     def __init__(self, batch_size, train=None, reg = None, validation=None, test=None, predict=None,
                  wrap=False, num_workers=None, shuffle_test_loader=False, use_worker_init_fn=False,
@@ -239,9 +240,9 @@ class DataModuleFromConfig(pl.LightningDataModule):
             self.dataset_configs["train"] = train
         if reg is not None:
             self.dataset_configs["reg"] = reg
-        
+
         self.train_dataloader = self._train_dataloader
-        
+
         if validation is not None:
             self.dataset_configs["validation"] = validation
             self.val_dataloader = partial(self._val_dataloader, shuffle=shuffle_val_dataloader)
@@ -274,7 +275,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
         train_set = self.datasets["train"]
         reg_set = self.datasets["reg"]
         concat_dataset = ConcatDataset(train_set, reg_set)
-        return DataLoader(concat_dataset, batch_size=self.batch_size,
+        return DataLoader(concat_dataset, batch_size=self.batch_size, pin_memory=False,
                           num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
                           worker_init_fn=init_fn)
 
@@ -324,7 +325,7 @@ class SetupCallback(Callback):
 
     def on_keyboard_interrupt(self, trainer, pl_module):
         if trainer.global_rank == 0:
-            print("Summoning checkpoint.")
+            print("Saving checkpoint.")
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
             trainer.save_checkpoint(ckpt_path)
 
@@ -395,21 +396,38 @@ class ImageLogger(Callback):
     def log_local(self, save_dir, split, images,
                   global_step, current_epoch, batch_idx):
         root = os.path.join(save_dir, "images", split)
+        images_pil = []
         for k in images:
             grid = torchvision.utils.make_grid(images[k], nrow=4)
             if self.rescale:
-                grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
+                    grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
             grid = grid.transpose(0, 1).transpose(1, 2).squeeze(-1)
             grid = grid.numpy()
             grid = (grid * 255).astype(np.uint8)
-            filename = "{}_gs-{:06}_e-{:06}_b-{:06}.jpg".format(
-                k,
+            images_pil.append(grid)
+        output_image = np.vstack(images_pil)
+        filename = "gs-{:06}_e-{:06}_b-{:06}.jpg".format(
                 global_step,
                 current_epoch,
                 batch_idx)
-            path = os.path.join(root, filename)
-            os.makedirs(os.path.split(path)[0], exist_ok=True)
-            Image.fromarray(grid).save(path)
+        path = os.path.join(root, filename)
+        os.makedirs(os.path.split(path)[0], exist_ok=True)
+        Image.fromarray(output_image).save(path)
+        # for k in images:
+        #     grid = torchvision.utils.make_grid(images[k], nrow=4)
+        #     if self.rescale:
+        #         grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
+        #     grid = grid.transpose(0, 1).transpose(1, 2).squeeze(-1)
+        #     grid = grid.numpy()
+        #     grid = (grid * 255).astype(np.uint8)
+        #     filename = "{}_gs-{:06}_e-{:06}_b-{:06}.jpg".format(
+        #         k,
+        #         global_step,
+        #         current_epoch,
+        #         batch_idx)
+        #     path = os.path.join(root, filename)
+        #     os.makedirs(os.path.split(path)[0], exist_ok=True)
+        #     Image.fromarray(grid).save(path)
 
     def log_img(self, pl_module, batch, batch_idx, split="train"):
         check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
@@ -475,6 +493,8 @@ class CUDACallback(Callback):
         self.start_time = time.time()
 
     def on_train_epoch_end(self, trainer, pl_module):
+        gc.collect()
+        torch.cuda.empty_cache()
         torch.cuda.synchronize(trainer.root_gpu)
         max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
         epoch_time = time.time() - self.start_time
@@ -594,7 +614,7 @@ if __name__ == "__main__":
 
         if opt.datadir_in_name:
             now = os.path.basename(os.path.normpath(opt.data_root)) + now
-            
+
         nowname = now + name + opt.postfix
         logdir = os.path.join(opt.logdir, nowname)
 
@@ -617,7 +637,7 @@ if __name__ == "__main__":
             trainer_config["accelerator"] = "cpu"
             cpu = True
         else:
-            trainer_config["accelerator"] = "ddp"
+            trainer_config["accelerator"] = "gpu"
             gpuinfo = trainer_config["gpus"]
             print(f"Running on GPUs {gpuinfo}")
             cpu = False
@@ -632,7 +652,7 @@ if __name__ == "__main__":
 
         # if opt.init_word:
         #     config.model.params.personalization_config.params.initializer_words[0] = opt.init_word
-            
+
         config.data.params.train.params.placeholder_token = opt.class_word
         config.data.params.reg.params.placeholder_token = opt.class_word
         config.data.params.validation.params.placeholder_token = opt.class_word
@@ -781,7 +801,6 @@ if __name__ == "__main__":
         config.data.params.validation.params.data_root = opt.data_root
         data = instantiate_from_config(config.data)
 
-        data = instantiate_from_config(config.data)
         # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
         # calling these ourselves should not be necessary but it is.
         # lightning still takes care of proper multiprocessing though
