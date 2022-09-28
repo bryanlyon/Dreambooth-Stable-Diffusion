@@ -158,6 +158,16 @@ class CrossAttention(nn.Module):
 
         self.scale = dim_head ** -0.5
         self.heads = heads
+        self.dim_head = dim_head
+
+        # Flash attention thanks to https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/labml_nn/diffusion/stable_diffusion/model/unet_attention.py#L192
+        try:
+            from flash_attn.flash_attention import FlashAttention
+            self.flash = FlashAttention(softmax_scale=self.scale)
+            print("Flash Attention Enabled")
+        except ImportError:
+            print("Flash Attention Disabled")
+            self.flash = None
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
@@ -169,65 +179,80 @@ class CrossAttention(nn.Module):
         )
 
     def forward(self, x, context=None, mask=None):
+        q = self.to_q(x)
+        context = default(context, x)
+        k = self.to_k(context)
+        v = self.to_v(context)
+
         if self.device == 'cpu':
-            h = self.heads
-
-            q = self.to_q(x)
-            context = default(context, x)
-            k = self.to_k(context)
-            v = self.to_v(context)
-            del context, x
-
-            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-
-            sim = einsum('b i d, b j d -> b i j', q, k) * self.scale  # (8, 4096, 40)
-            del q, k
-
-            if exists(mask):
-                mask = rearrange(mask, 'b ... -> b (...)')
-                max_neg_value = -torch.finfo(sim.dtype).max
-                mask = repeat(mask, 'b j -> (b h) () j', h=h)
-                sim.masked_fill_(~mask, max_neg_value)
-                del mask
-
-            # attention, what we cannot get enough of, by halves
-            sim[4:] = sim[4:].softmax(dim=-1)
-            sim[:4] = sim[:4].softmax(dim=-1)
-
-            sim = einsum('b i j, b j d -> b i d', sim, v)
-            sim = rearrange(sim, '(b h) n d -> b n (h d)', h=h)
-            return self.to_out(sim)
+            out = self._attn(q,k,v)
+        elif self.flash is not None and self.dim_head <= 64 and context is x:
+            out = self._flash(q,k,v)
         else:
-            h = self.heads
+            out = self._split(q,k,v)
+        return self.to_out(out)
 
-            q = self.to_q(x)
-            context = default(context, x)
-            k = self.to_k(context)
-            v = self.to_v(context)
-            del context, x
+    def _attn(self,q,k,v):
+        h = self.heads
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale  # (8, 4096, 40)
+        del q, k
 
-            r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device)
+        if exists(mask):
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+            del mask
 
-            # valid values for steps = 2,4,8,16,32,64
-            # higher steps is slower but less memory usage
-            # at 16 can run 1920x1536 on a 3090, at 64 can run over 1920x1920
-            # speed seems to be impacted more on 30x series cards
-            steps = 16
-            slice_size = q.shape[1] // steps if q.shape[1] % steps == 0 else q.shape[1]
-            for i in range(0, q.shape[1], slice_size):
-                end = i + slice_size
-                s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k)
-                s1 *= self.scale
-                s2 = s1.softmax(dim=-1)
-                del s1
-                r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
-                del s2
-            r2 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
-            del r1
+        # attention, what we cannot get enough of, by halves
+        sim[4:] = sim[4:].softmax(dim=-1)
+        sim[:4] = sim[:4].softmax(dim=-1)
 
-            return self.to_out(r2)
+        sim = einsum('b i j, b j d -> b i d', sim, v)
+        sim = rearrange(sim, '(b h) n d -> b n (h d)', h=h)
+        return sim
+
+    def _split(self,q,k,v):
+        h = self.heads
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device)
+
+        # valid values for steps = 2,4,8,16,32,64
+        # higher steps is slower but less memory usage
+        # at 16 can run 1920x1536 on a 3090, at 64 can run over 1920x1920
+        # speed seems to be impacted more on 30x series cards
+        steps = 16
+        slice_size = q.shape[1] // steps if q.shape[1] % steps == 0 else q.shape[1]
+        for i in range(0, q.shape[1], slice_size):
+            end = i + slice_size
+            s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k)
+            s1 *= self.scale
+            s2 = s1.softmax(dim=-1)
+            del s1
+            r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
+            del s2
+        out = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
+        return out
+
+    def _flash(self,q,k,v):
+        batch_size, seq_len, _ = q.shape
+        h = self.heads
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b n h d', h=h), (q, k, v))
+
+        qkv = torch.stack((q, k, v), dim=2)
+        qkv = qkv.view(batch_size, seq_len, 3, self.heads, self.dim_head)
+
+        pad = 64 - self.dim_head
+        if pad > 0:
+            qkv = torch.cat((qkv, qkv.new_zeros(batch_size, seq_len, 3, self.heads, pad)), dim=-1)
+
+        r2, _ = self.flash(qkv.half()) #Only works with 16 bit floats. Hack to allow rest of model to remain float32
+        r2 = r2[:, :, :, :self.dim_head] #remove padding
+        out = r2.reshape(batch_size, seq_len, self.heads * self.dim_head).float()
+        return out
 
 class BasicTransformerBlock(nn.Module):
     def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
