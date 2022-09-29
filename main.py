@@ -406,7 +406,7 @@ class ImageLogger(Callback):
             grid = (grid * 255).astype(np.uint8)
             images_pil.append(grid)
         output_image = np.vstack(images_pil)
-        filename = "gs-{:06}_e-{:06}_b-{:06}.jpg".format(
+        filename = "gs-{:06}_e-{:06}_b-{:06}.png".format(
                 global_step,
                 current_epoch,
                 batch_idx)
@@ -837,7 +837,7 @@ if __name__ == "__main__":
         def melk(*args, **kwargs):
             # run all checkpoint hooks
             if trainer.global_rank == 0:
-                print("Summoning checkpoint.")
+                print("Saving checkpoint.")
                 ckpt_path = os.path.join(ckptdir, "last.ckpt")
                 trainer.save_checkpoint(ckpt_path)
 

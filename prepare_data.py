@@ -18,10 +18,10 @@ parser.add_argument("--descriptives",
 opt = parser.parse_args()
 opt.export_path = opt.export_path.replace("$path", opt.path)
 
-for cnt, infile in enumerate(tqdm([x for x in sorted(os.listdir(opt.path)) if "jpg" in x.lower()])):
+for cnt, infile in enumerate(tqdm([x for x in sorted(os.listdir(opt.path)) if "jpg" in x.lower() or "png" in x.lower()])):
     if not os.path.exists(opt.export_path):
         os.makedirs(opt.export_path)
-    outfile = os.path.join(opt.export_path, f"{str(cnt).zfill(5)}-{opt.descriptives}.png")
+    outfile = os.path.join(opt.export_path, f"{str(cnt).zfill(5)}-{opt.descriptives.replace('-','_')}.png")
     infile = os.path.join(opt.path, infile)
     try:
         im = cv2.imread(infile)
@@ -30,7 +30,7 @@ for cnt, infile in enumerate(tqdm([x for x in sorted(os.listdir(opt.path)) if "j
         resize = minsize / min_side
         new_h = int(h*resize)
         new_w = int(w*resize)
-        im = cv2.resize(im, (int(w*resize), int(h*resize)))
+        im = cv2.resize(im, (int(w*resize), int(h*resize)),interpolation=cv2.INTER_CUBIC)
         if new_h > 512:
             im = im[:512,:]
         if new_w > 512:

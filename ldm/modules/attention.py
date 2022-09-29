@@ -185,14 +185,14 @@ class CrossAttention(nn.Module):
         v = self.to_v(context)
 
         if self.device == 'cpu':
-            out = self._attn(q,k,v)
+            out = self._attn(q,k,v,mask=mask)
         elif self.flash is not None and self.dim_head <= 64 and context is x:
             out = self._flash(q,k,v)
         else:
-            out = self._split(q,k,v)
+            out = self._attn(q,k,v,mask=mask)
         return self.to_out(out)
 
-    def _attn(self,q,k,v):
+    def _attn(self,q,k,v,mask=None):
         h = self.heads
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
@@ -214,7 +214,7 @@ class CrossAttention(nn.Module):
         sim = rearrange(sim, '(b h) n d -> b n (h d)', h=h)
         return sim
 
-    def _split(self,q,k,v):
+    def _split(self,q,k,v,mask=None):
         h = self.heads
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
@@ -240,16 +240,15 @@ class CrossAttention(nn.Module):
     def _flash(self,q,k,v):
         batch_size, seq_len, _ = q.shape
         h = self.heads
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b n h d', h=h), (q, k, v))
 
         qkv = torch.stack((q, k, v), dim=2)
         qkv = qkv.view(batch_size, seq_len, 3, self.heads, self.dim_head)
 
-        pad = 64 - self.dim_head
+        pad = (64 - self.dim_head) % 32
         if pad > 0:
             qkv = torch.cat((qkv, qkv.new_zeros(batch_size, seq_len, 3, self.heads, pad)), dim=-1)
 
-        r2, _ = self.flash(qkv.half()) #Only works with 16 bit floats. Hack to allow rest of model to remain float32
+        r2, _ = self.flash(qkv.bfloat16()) #Only works with 16 bit floats. Hack to allow rest of model to remain float32
         r2 = r2[:, :, :, :self.dim_head] #remove padding
         out = r2.reshape(batch_size, seq_len, self.heads * self.dim_head).float()
         return out
