@@ -164,10 +164,18 @@ class CrossAttention(nn.Module):
         try:
             from flash_attn.flash_attention import FlashAttention
             self.flash = FlashAttention(softmax_scale=self.scale)
-            print("Flash Attention Enabled")
+            # print("Flash Attention Enabled")
         except ImportError:
-            print("Flash Attention Disabled")
+            # print("Flash Attention Disabled")
             self.flash = None
+
+        try:
+            import xformers.ops
+            self.xform = xformers.ops.memory_efficient_attention
+            # print("Flash Attention Enabled")
+        except ImportError:
+            # print("Flash Attention Disabled")
+            self.xform = None
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
@@ -186,6 +194,8 @@ class CrossAttention(nn.Module):
 
         if self.device == 'cpu':
             out = self._attn(q,k,v,mask=mask)
+        elif self.xform is not None and self.dim_head <= 64 and context is x:
+            out = self._xform(q,k,v)
         elif self.flash is not None and self.dim_head <= 64 and context is x:
             out = self._flash(q,k,v)
         else:
@@ -251,6 +261,17 @@ class CrossAttention(nn.Module):
         r2, _ = self.flash(qkv.bfloat16()) #Only works with 16 bit floats. Hack to allow rest of model to remain float32
         r2 = r2[:, :, :, :self.dim_head] #remove padding
         out = r2.reshape(batch_size, seq_len, self.heads * self.dim_head).float()
+        return out
+
+    def _xform(self,q,k,v):
+        batch_size, seq_len, _ = q.shape
+        h = self.heads
+        pad = (64 - self.dim_head) % 32
+        pad = q.new_zeros(batch_size*self.heads, seq_len, pad)
+        q, k, v = map(lambda t: torch.cat((rearrange(t, 'b n (h d) -> (b h) n d', h=h),pad),dim=-1).contiguous().bfloat16(), (q, k, v))
+        out = self.xform(q, k, v).float()
+        out = out[:, :, :self.dim_head] #remove padding
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return out
 
 class BasicTransformerBlock(nn.Module):
