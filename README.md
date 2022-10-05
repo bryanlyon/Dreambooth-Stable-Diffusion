@@ -5,8 +5,7 @@ This is an implementtaion of Google's [Dreambooth](https://arxiv.org/abs/2208.12
 This code repository is based on that of [Textual Inversion](https://github.com/rinongal/textual_inversion). Note that Textual Inversion only optimizes word ebedding, while dreambooth fine-tunes the whole diffusion model.
 
 The implementation makes minimum changes over the official codebase of Textual Inversion. In fact, due to lazyness, some components in Textual Inversion, such as the embedding manager, are not deleted, although they will never be used here.
-## Update
-**9/20/2022**: I just found a way to reduce the GPU memory a bit. Remember that this code is based on Textual Inversion, and TI's code base has [this line](https://github.com/rinongal/textual_inversion/blob/main/ldm/modules/diffusionmodules/util.py#L112), which disable gradient checkpointing in a hard-code way. This is because in TI, the Unet is not optimized. However, in Dreambooth we optimize the Unet, so we can turn on the gradient checkpoint pointing trick, as in the original SD repo [here](https://github.com/CompVis/stable-diffusion/blob/main/ldm/modules/diffusionmodules/util.py#L112). The gradient checkpoint is default to be True in [config](https://github.com/XavierXiao/Dreambooth-Stable-Diffusion/blob/main/configs/stable-diffusion/v1-finetune_unfrozen.yaml#L47). I have updated the codes.
+
 ## Usage
 
 ### Preparation
@@ -17,27 +16,28 @@ To fine-tune a stable diffusion model, you need to obtain the pre-trained stable
 We also need to create a set of images for regularization, as the fine-tuning algorithm of Dreambooth requires that. Details of the algorithm can be found in the paper. Note that in the original paper, the regularization images seem to be generated on-the-fly. However, here I generated a set of regularization images before the training. The text prompt for generating regularization images can be ```photo of a <class>```, where ```<class>``` is a word that describes the class of your object, such as ```dog```. The command is
 
 ```
-python scripts/stable_txt2img.py --ddim_eta 0.0 --n_samples 8 --n_iter 1 --scale 10.0 --ddim_steps 50  --ckpt /path/to/original/stable-diffusion/sd-v1-4-full-ema.ckpt --prompt "a photo of a <class>" 
+python scripts/stable_txt2img.py --ddim_eta 0.0 --n_samples 8 --n_iter 1 --scale 10.0 --ddim_steps 50  --ckpt /path/to/original/stable-diffusion/sd-v1-4-full-ema.ckpt --prompt "a photo of a <class>"
 ```
 
-I generate 8 images for regularization, but more regularization images may lead to stronger regularization and better editability. After that, save the generated images (separately, one image per ```.png``` file) at ```/root/to/regularization/images```.
+I generate ~100 images for regularization per descriptive, but more regularization images may lead to stronger regularization and better editability. After that, save the generated images (separately, one image per ```.png``` file) at ```/root/to/regularization/images```.
 
-**Updates on 9/9**
-We should definitely use more images for regularization. Please try 100 or 200, to better align with the original paper. To acomodate this, I shorten the "repeat" of reg dataset in the [config file](https://github.com/XavierXiao/Dreambooth-Stable-Diffusion/blob/main/configs/stable-diffusion/v1-finetune_unfrozen.yaml#L96).
+## Descriptives
 
-For some cases, if the generated regularization images are highly unrealistic (happens when you want to generate "man" or "woman"), you can find a diverse set of images (of man/woman) online, and use them as regularization images.
+Descriptives are words to describe the image beyond the class name.  This lets you provide more accurate regularization and training images in order to help keep editability.  To do this, I train multiple descriptions for example if the class is ```dog``` then I might have descriptives of ```brown```, ```black```, ```maltese``` or any other words you want to use to separate different types of the class.
+
+Once you have your various images, you can use the prepare_data.py script to rename them and (semi-intelligently) crop them to be 512x512 images ready to train with.  Right now it does a bit better than a center crop but improvements will allow for better and better crops over time.  (Planning on using YOLO or similar BBOX detection model to find a good bbox to crop around.)
 
 ### Training
 Training can be done by running the following command
 
 ```
-python main.py --base configs/stable-diffusion/v1-finetune_unfrozen.yaml 
-                -t 
+python main.py --base configs/stable-diffusion/v1-finetune_unfrozen.yaml
+                -t
                 --actual_resume /path/to/original/stable-diffusion/sd-v1-4-full-ema.ckpt  
-                -n <job name> 
-                --gpus 0, 
-                --data_root /root/to/training/images 
-                --reg_data_root /root/to/regularization/images 
+                -n <job name>
+                --gpus 0,
+                --data_root /root/to/training/images
+                --reg_data_root /root/to/regularization/images
                 --class_word <xxx>
 ```
 
@@ -51,13 +51,13 @@ Training will be run for 800 steps, and two checkpoints will be saved at ```./lo
 After training, personalized samples can be obtained by running the command
 
 ```
-python scripts/stable_txt2img.py --ddim_eta 0.0 
-                                 --n_samples 8 
-                                 --n_iter 1 
-                                 --scale 10.0 
+python scripts/stable_txt2img.py --ddim_eta 0.0
+                                 --n_samples 8
+                                 --n_iter 1
+                                 --scale 10.0
                                  --ddim_steps 100  
                                  --ckpt /path/to/saved/checkpoint/from/training
-                                 --prompt "photo of a sks <class>" 
+                                 --prompt "photo of a <class>"
 ```
 
 In particular, ```sks``` is the identifier, which should be replaced by your choice if you happen to change the identifier, and ```<class>``` is the class word ```--class_word``` for training.
@@ -88,4 +88,3 @@ Generated images with prompt ```photo of a red sks container```:
 Generated images with prompt ```a dog on top of sks container```:
 
 ![](assets/a-dog-on-top-of-sks-container-0023.jpg)
-
